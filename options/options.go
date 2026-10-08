@@ -42,7 +42,7 @@ func (this *Option) SetNormalTaskHandleDelta(a time.Duration) {
 
 // 具有顺序的任务，需要强制执行完每一个，当其中一个报错的时候，重复执行的间隔
 func (this *Option) SetOrderTaskHandleDelta(a []time.Duration) {
-	if a == nil {
+	if len(a) == 0 {
 		return
 	}
 	this.OrderTaskHandleDelta = a
@@ -64,7 +64,7 @@ func (this *Option) merge(delta *Option) *Option {
 		this.NormalTaskHandleDelta = delta.NormalTaskHandleDelta
 	}
 
-	if delta.OrderTaskHandleDelta != nil {
+	if len(delta.OrderTaskHandleDelta) != 0 {
 		this.OrderTaskHandleDelta = delta.OrderTaskHandleDelta
 	}
 	return this

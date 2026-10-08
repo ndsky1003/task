@@ -30,12 +30,9 @@ type task_mgr struct {
 	opt                       *options.Option
 }
 
-/*
-concurrenceNum:任务最大并发数量，数量必须大于强制顺序顺序类型的数量多，否则并发数有可能被其全部占用，而普通任务无法执行
-sleep_deltas:任务处理错误的增量
-task_serialize: 任务的管理，序列化、反序列化、hasnext，next等
-fn:具体任务的处理逻辑
-*/
+// NewTaskMgr 创建任务管理器并启动任务循环。
+// 注意：最大并发数 opt.ConcurrenceNum 必须大于有序任务类型数，
+// 否则有序任务会占满并发槽，导致普通任务无法执行。
 func NewTaskMgr(task_serialize serialize.ITaskSerialize, op operator.IOperator, opts ...*options.Option) *task_mgr {
 	if task_serialize == nil {
 		panic("task_serialize must not nil")
@@ -87,12 +84,13 @@ func (this *task_mgr) Start() {
 	this.handleStatus(&handleStatusReq{status: taskmgrstatus.Start})
 }
 
-func (this *task_mgr) Stop() {
-	this.handleStatus(&handleStatusReq{status: taskmgrstatus.Stop})
+func (this *task_mgr) Stop() bool {
+	return this.handleStatus(&handleStatusReq{status: taskmgrstatus.Stop})
 }
 
-// 之所以加锁,是因为并发调用,关闭不应该关闭的done,那么每次给done加上一个指纹,关闭的时候必须凭借指纹关闭
-func (this *task_mgr) handleStatus(req *handleStatusReq) {
+// handleStatus 处理启动/停止/错误还原，全程加锁以避免并发关闭 done。
+// 返回值仅对 Stop 有意义：true 表示任务循环已停止运行。
+func (this *task_mgr) handleStatus(req *handleStatusReq) bool {
 	this.l.Lock()
 	defer this.l.Unlock()
 	switch req.status {
@@ -101,34 +99,39 @@ func (this *task_mgr) handleStatus(req *handleStatusReq) {
 			if task, ok := req.meta.(itask.ITask); ok {
 				if err := this.task_serialize.UpdateStatus2Init(task); err != nil {
 					logger.Errf("task:%v,err:%v\n", task, err)
-					break
+					return false
 				}
 			}
 		}
 		if !atomic.CompareAndSwapUint32(&this.status, taskmgrstatus.Stop, taskmgrstatus.Start) {
-			logger.Info("Loop has run")
-		} else {
-			if this.done != nil {
-				close(this.done)
-				this.done = nil
-			}
-			this.done = make(chan struct{}, 1)
-			go this.run_loop(this.done)
+			return false
 		}
+		if this.done != nil {
+			close(this.done)
+			this.done = nil
+		}
+		this.done = make(chan struct{}, 1)
+		go this.run_loop(this.done)
+		return false
 	case taskmgrstatus.Stop:
-		if b, err := this.task_serialize.HasNext(this.handling_order_task_types...); err != nil {
+		b, err := this.task_serialize.HasNext(this.handling_order_task_types...)
+		if err != nil {
 			logger.Err(err)
-		} else if !b {
-			if !atomic.CompareAndSwapUint32(&this.status, taskmgrstatus.Start, taskmgrstatus.Stop) {
-				logger.Info("Loop has stop")
-			} else {
-				if this.done != nil {
-					close(this.done)
-					this.done = nil
-				}
-			}
+			return false
 		}
+		if b {
+			return false
+		}
+		if !atomic.CompareAndSwapUint32(&this.status, taskmgrstatus.Start, taskmgrstatus.Stop) {
+			return true
+		}
+		if this.done != nil {
+			close(this.done)
+			this.done = nil
+		}
+		return true
 	}
+	return false
 }
 
 // 添加任务
@@ -161,22 +164,28 @@ func (this *task_mgr) run_loop(done chan struct{}) {
 		case <-done:
 			return
 		default:
-			if task, err := this.task_serialize.Next(this.get_handling_order_task_types()...); err == nil {
-				this.concurrenceNum <- struct{}{}
-				if task.IsOrder() {
-					this.push_handling_order_task_types(task.GetType())
-					go this.handdleTaskByType(task)
-				} else {
-					go this.handdleTask(task)
-				}
-			} else {
-				if err == itask.ErrNoTask {
-					this.Stop()
-				} else {
-					logger.Err(err)
-				}
-			}
 		}
+
+		task, err := this.task_serialize.Next(this.get_handling_order_task_types()...)
+		if err == nil {
+			this.concurrenceNum <- struct{}{}
+			if task.IsOrder() {
+				this.push_handling_order_task_types(task.GetType())
+				go this.handdleTaskByType(task)
+			} else {
+				go this.handdleTask(task)
+			}
+			continue
+		}
+		if err == itask.ErrNoTask {
+			// 无任务则尝试停止；若已停止则退出循环
+			if this.Stop() {
+				return
+			}
+			continue
+		}
+		logger.Err(err)
+		time.Sleep(time.Second)
 	}
 }
 
@@ -201,9 +210,12 @@ func (this *task_mgr) handdleTask(task itask.ITask) {
 
 func (this *task_mgr) sleep(index uint8) uint8 {
 	loopLength := len(this.opt.OrderTaskHandleDelta)
+	if loopLength == 0 {
+		time.Sleep(time.Second)
+		return index + 1
+	}
 	si := int(index) % loopLength
 	sv := this.opt.OrderTaskHandleDelta[si]
-	// logger.Info("sleep:", sv)
 	time.Sleep(sv)
 	index++
 	return index
@@ -234,7 +246,8 @@ here:
 		if err == itask.ErrNoTask {
 			return
 		}
-		logger.Err("panic")
+		logger.Err(err)
+		time.Sleep(time.Second)
 		goto here
 	}
 	if isPanic = this._handdleTaskByType(task); isPanic {
