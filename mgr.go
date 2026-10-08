@@ -1,6 +1,7 @@
 package task
 
 import (
+	"log/slog"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -9,7 +10,6 @@ import (
 
 	"github.com/ndsky1003/task/itask"
 	"github.com/ndsky1003/task/operator"
-	"github.com/ndsky1003/task/options"
 	"github.com/ndsky1003/task/serialize"
 	"github.com/ndsky1003/task/taskmgrstatus"
 )
@@ -21,27 +21,26 @@ type handleStatusReq struct {
 
 type task_mgr struct {
 	l                         sync.Mutex
-	status                    uint32
+	status                    atomic.Uint32
 	handling_order_task_types []uint32 // 正在执行的OrderTask的Type
 	task_serialize            serialize.ITaskSerialize
 	_handle_task_operator     operator.IOperator
 	done                      chan struct{}
 	concurrenceNum            chan struct{} // 限流
-	opt                       *options.Option
+	opt                       *Option
 }
 
 // NewTaskMgr 创建任务管理器并启动任务循环。
 // 注意：最大并发数 opt.ConcurrenceNum 必须大于有序任务类型数，
 // 否则有序任务会占满并发槽，导致普通任务无法执行。
-func NewTaskMgr(task_serialize serialize.ITaskSerialize, op operator.IOperator, opts ...*options.Option) *task_mgr {
+func NewTaskMgr(task_serialize serialize.ITaskSerialize, op operator.IOperator, opts ...*Option) *task_mgr {
 	if task_serialize == nil {
 		panic("task_serialize must not nil")
 	}
-
 	if op == nil {
 		panic("op must not nil")
 	}
-	opt := options.New().Merge(opts...)
+	opt := Options().Merge(opts...)
 
 	c := &task_mgr{
 		concurrenceNum:        make(chan struct{}, opt.ConcurrenceNum),
@@ -98,12 +97,13 @@ func (this *task_mgr) handleStatus(req *handleStatusReq) bool {
 		if req.status == taskmgrstatus.HandleError {
 			if task, ok := req.meta.(itask.ITask); ok {
 				if err := this.task_serialize.UpdateStatus2Init(task); err != nil {
-					logger.Errf("task:%v,err:%v\n", task, err)
+					slog.Error("task:%v,err:%v\n", "task", task, "err", err)
 					return false
 				}
 			}
 		}
-		if !atomic.CompareAndSwapUint32(&this.status, taskmgrstatus.Stop, taskmgrstatus.Start) {
+		if !this.status.CompareAndSwap(taskmgrstatus.Stop, taskmgrstatus.Start) {
+			// if !atomic.CompareAndSwapUint32(&this.status, taskmgrstatus.Stop, taskmgrstatus.Start) {
 			return false
 		}
 		if this.done != nil {
@@ -116,13 +116,14 @@ func (this *task_mgr) handleStatus(req *handleStatusReq) bool {
 	case taskmgrstatus.Stop:
 		b, err := this.task_serialize.HasNext(this.handling_order_task_types...)
 		if err != nil {
-			logger.Err(err)
+			slog.Error(err.Error())
 			return false
 		}
 		if b {
 			return false
 		}
-		if !atomic.CompareAndSwapUint32(&this.status, taskmgrstatus.Start, taskmgrstatus.Stop) {
+		if !this.status.CompareAndSwap(taskmgrstatus.Start, taskmgrstatus.Stop) {
+			// if !atomic.CompareAndSwapUint32(&this.status, taskmgrstatus.Start, taskmgrstatus.Stop) {
 			return true
 		}
 		if this.done != nil {
@@ -155,9 +156,9 @@ func (this *task_mgr) add(task itask.ITask) error {
 }
 
 func (this *task_mgr) run_loop(done chan struct{}) {
-	logger.Info("start runloop")
+	slog.Info("start runloop")
 	defer func() {
-		logger.Info("runloop done")
+		slog.Info("runloop done")
 	}()
 	for {
 		select {
@@ -184,7 +185,7 @@ func (this *task_mgr) run_loop(done chan struct{}) {
 			}
 			continue
 		}
-		logger.Err(err)
+		slog.Info(err.Error())
 		time.Sleep(time.Second)
 	}
 }
@@ -203,7 +204,7 @@ func (this *task_mgr) handdleTask(task itask.ITask) {
 		})
 	} else { // 处理成功，删除任务
 		if err1 := this.task_serialize.Remove(task); err1 != nil {
-			logger.Errf("task:%+v,err:%v", task, err1)
+			slog.Error("task:%+v,err:%v", "task", task, "err1", err1)
 		}
 	}
 }
@@ -224,16 +225,16 @@ func (this *task_mgr) sleep(index uint8) uint8 {
 // 某些任务按照添加顺序执行
 func (this *task_mgr) handdleTaskByType(task itask.ITask) {
 	t := task.GetType()
-	logger.Info("handdleTaskByType:", t)
+	slog.Info("handdleTaskByType:", t)
 	var isPanic bool
 	defer func() {
 		if !isPanic {
 			// 防止下次再次进入
 			this.pop_handling_order_task_types(t)
 		} else {
-			logger.Infof("task type:%v not handle", t)
+			slog.Info("task type not handle", "type", t)
 		}
-		logger.Info("defer handdleTaskByType")
+		slog.Info("defer handdleTaskByType")
 		<-this.concurrenceNum
 	}()
 	if isPanic = this._handdleTaskByType(task); isPanic {
@@ -246,7 +247,7 @@ here:
 		if err == itask.ErrNoTask {
 			return
 		}
-		logger.Err(err)
+		slog.Error(err.Error())
 		time.Sleep(time.Second)
 		goto here
 	}
@@ -264,14 +265,14 @@ here:
 	if err != nil {
 		index = this.sleep(index)
 		if index == 255 {
-			logger.Errf("isPanic,t:%v,err:%v", task.GetType(), err)
+			slog.Error("isPanic,t:%v,err:%v", "type", task.GetType(), "err", err)
 			isPanic = true
 			return
 		}
 		goto here
 	} else { // 处理成功，删除任务
 		if err1 := this.task_serialize.Remove(task); err1 != nil {
-			logger.Errf("task:%+v\n", task)
+			slog.Error("task:%+v\n", "task", task)
 		}
 	}
 	return
