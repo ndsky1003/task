@@ -11,8 +11,8 @@ import (
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/bson/primitive"
 
-	"github.com/ndsky1003/task/itask"
 	"github.com/ndsky1003/task/serialize"
+	"github.com/ndsky1003/task/task"
 	"github.com/ndsky1003/task/taskstatus"
 )
 
@@ -23,10 +23,10 @@ func TestHandleTaskPanicRecovered(t *testing.T) {
 	requireMongo(t)
 	db, coll := "task_test_panic_normal", "tasks"
 	dropCollection(t, db, coll)
-	ser := serialize.Mongo[testTask](mongoClient, db, coll)
+	ser := serialize.Mongo(mongoClient, db, coll)
 
 	var count atomic.Int32
-	op := &fnOperator{fn: func(tk itask.ITask) error {
+	op := &fnOperator{fn: func(tk *task.Task) error {
 		if count.Add(1) == 1 {
 			panic("业务代码 panic")
 		}
@@ -37,12 +37,8 @@ func TestHandleTaskPanicRecovered(t *testing.T) {
 	opt.SetNormalTaskHandleDelta(50 * time.Millisecond)
 	mgr := NewTaskMgr(ser, op, opt)
 
-	id := primitive.NewObjectID()
-	if err := mgr.Add(&testTask{ID: id, Type: 1, Payload: "panic"}); err != nil {
-		t.Fatalf("Add: %v", err)
-	}
+	id := addTask(t, mgr, 1, false, "panic")
 
-	// panic 被捕获后任务重试并最终成功删除；进程不崩溃（测试能走到这里）
 	waitFor(t, 8*time.Second, func() bool {
 		return count.Load() >= 2 && !docExists(db, coll, id)
 	})
@@ -53,10 +49,10 @@ func TestHandleTaskPanicInOrderTask(t *testing.T) {
 	requireMongo(t)
 	db, coll := "task_test_panic_order", "tasks"
 	dropCollection(t, db, coll)
-	ser := serialize.Mongo[testTask](mongoClient, db, coll)
+	ser := serialize.Mongo(mongoClient, db, coll)
 
 	var count atomic.Int32
-	op := &fnOperator{fn: func(tk itask.ITask) error {
+	op := &fnOperator{fn: func(tk *task.Task) error {
 		if count.Add(1) == 1 {
 			panic("业务代码 panic")
 		}
@@ -67,10 +63,7 @@ func TestHandleTaskPanicInOrderTask(t *testing.T) {
 	opt.SetOrderTaskHandleDelta([]time.Duration{10 * time.Millisecond})
 	mgr := NewTaskMgr(ser, op, opt)
 
-	id := primitive.NewObjectID()
-	if err := mgr.Add(&testTask{ID: id, Type: 1, Order: true, CreateTime: time.Now(), Payload: "panic-order"}); err != nil {
-		t.Fatalf("Add: %v", err)
-	}
+	id := addTask(t, mgr, 1, true, "panic-order")
 
 	waitFor(t, 8*time.Second, func() bool {
 		return count.Load() >= 2 && !docExists(db, coll, id)
@@ -82,17 +75,16 @@ func TestHandleTaskPanicInOrderTask(t *testing.T) {
 // TestRemoveRetryEventuallyDeletes 删除失败后应自动重试直至成功。
 func TestRemoveRetryEventuallyDeletes(t *testing.T) {
 	f := &fakeSerialize{removeFailTimes: 2}
-	op := &fnOperator{fn: func(tk itask.ITask) error { return nil }}
+	op := &fnOperator{fn: func(tk *task.Task) error { return nil }}
 	opt := Options()
 	opt.SetConcurrenceNum(2)
 	opt.SetNormalTaskHandleDelta(20 * time.Millisecond)
 	mgr := NewTaskMgr(f, op, opt)
 
-	if err := mgr.Add(&testTask{ID: primitive.NewObjectID(), Type: 1}); err != nil {
+	if err := mgr.Add(mkPayload("x"), task.Meta{ID: "id-1", Type: 1}); err != nil {
 		t.Fatalf("Add: %v", err)
 	}
 
-	// 前 2 次删除失败，第 3 次成功
 	waitFor(t, 3*time.Second, func() bool {
 		f.mu.Lock()
 		defer f.mu.Unlock()
@@ -110,7 +102,7 @@ func TestRemoveRetryEventuallyDeletes(t *testing.T) {
 func TestUpdateStatus2InitRetrySucceeds(t *testing.T) {
 	f := &fakeSerialize{updateFailTimes: 1}
 	var count atomic.Int32
-	op := &fnOperator{fn: func(tk itask.ITask) error {
+	op := &fnOperator{fn: func(tk *task.Task) error {
 		count.Add(1)
 		if count.Load() == 1 {
 			return errors.New("handle fail")
@@ -122,11 +114,10 @@ func TestUpdateStatus2InitRetrySucceeds(t *testing.T) {
 	opt.SetNormalTaskHandleDelta(20 * time.Millisecond)
 	mgr := NewTaskMgr(f, op, opt)
 
-	if err := mgr.Add(&testTask{ID: primitive.NewObjectID(), Type: 1}); err != nil {
+	if err := mgr.Add(mkPayload("x"), task.Meta{ID: "id-1", Type: 1}); err != nil {
 		t.Fatalf("Add: %v", err)
 	}
 
-	// 第一次处理失败 + 第一次还原失败，重试后还原成功、任务重新入队并被再次处理删除
 	waitFor(t, 5*time.Second, func() bool {
 		f.mu.Lock()
 		defer f.mu.Unlock()
@@ -144,12 +135,12 @@ func TestIsPanicMarksDead(t *testing.T) {
 	requireMongo(t)
 	db, coll := "task_test_dead", "tasks"
 	dropCollection(t, db, coll)
-	ser := serialize.Mongo[testTask](mongoClient, db, coll)
+	ser := serialize.Mongo(mongoClient, db, coll)
 
 	var failCount atomic.Int32
-	op := &fnOperator{fn: func(tk itask.ITask) error {
-		tt := tk.(*testTask)
-		if tt.Payload == "fail" {
+	op := &fnOperator{fn: func(tk *task.Task) error {
+		p := payloadOf(tk)
+		if p == "fail" {
 			failCount.Add(1)
 			return fmt.Errorf("永远失败")
 		}
@@ -158,87 +149,33 @@ func TestIsPanicMarksDead(t *testing.T) {
 	opt := Options()
 	opt.SetConcurrenceNum(5)
 	opt.SetOrderTaskHandleDelta([]time.Duration{time.Nanosecond})
+	opt.SetOrderTaskMaxRetry(3)
 	mgr := NewTaskMgr(ser, op, opt)
 
-	failID := primitive.NewObjectID()
-	okID := primitive.NewObjectID()
+	failID := primitive.NewObjectID().Hex()
+	okID := primitive.NewObjectID().Hex()
 	base := time.Now()
-	if err := mgr.Add(&testTask{ID: failID, Type: 50, Order: true, CreateTime: base, Payload: "fail"}); err != nil {
-		t.Fatalf("Add fail: %v", err)
+	bfail := mkPayload("fail")
+	if err := mgr.add(&task.Task{ID: failID, Type: 50, Order: true, CreateTime: base, Data: bfail}); err != nil {
+		t.Fatalf("add fail: %v", err)
 	}
-	if err := mgr.Add(&testTask{ID: okID, Type: 50, Order: true, CreateTime: base.Add(time.Second), Payload: "ok"}); err != nil {
-		t.Fatalf("Add ok: %v", err)
+	bok := mkPayload("ok")
+	if err := mgr.add(&task.Task{ID: okID, Type: 50, Order: true, CreateTime: base.Add(time.Second), Data: bok}); err != nil {
+		t.Fatalf("add ok: %v", err)
 	}
 
-	// fail 任务重试耗尽（255 次）
-	waitFor(t, 10*time.Second, func() bool { return failCount.Load() >= 255 })
-	// ok 任务应被正常处理删除，说明 isPanic 未阻塞同类型
+	// fail 任务重试耗尽（3 次）
+	waitFor(t, 10*time.Second, func() bool { return failCount.Load() >= 3 })
+	// ok 任务应被正常处理删除，说明死信未阻塞同类型
 	waitFor(t, 5*time.Second, func() bool { return !docExists(db, coll, okID) })
 
-	// fail 任务应被标记为 Dead
-	var doc testTask
+	var doc task.Task
 	if err := mongoClient.Database(db).Collection(coll).FindOne(context.Background(), bson.M{"_id": failID}).Decode(&doc); err != nil {
 		t.Fatalf("查询 fail 任务: %v", err)
 	}
 	if doc.Status != taskstatus.Dead {
 		t.Fatalf("重试耗尽后任务状态应为 Dead, got %v", doc.Status)
 	}
-}
-
-// ---------- 修复 3：跨实例有序任务锁 ----------
-
-// TestCrossInstanceOrderLock 两个实例共享存储时，同一类型有序任务应仍保持串行。
-func TestCrossInstanceOrderLock(t *testing.T) {
-	requireMongo(t)
-	db, coll := "task_test_cross_lock", "tasks"
-	dropCollection(t, db, coll)
-	ser := serialize.Mongo[testTask](mongoClient, db, coll)
-
-	var running, peak, done atomic.Int32
-	op := &fnOperator{fn: func(tk itask.ITask) error {
-		c := running.Add(1)
-		for {
-			p := peak.Load()
-			if c <= p || peak.CompareAndSwap(p, c) {
-				break
-			}
-		}
-		time.Sleep(50 * time.Millisecond)
-		running.Add(-1)
-		done.Add(1)
-		return nil
-	}}
-
-	// 两个实例共享同一存储，模拟多实例部署
-	optA := Options()
-	optA.SetConcurrenceNum(10)
-	optB := Options()
-	optB.SetConcurrenceNum(10)
-	mgrA := NewTaskMgr(ser, op, optA)
-	mgrB := NewTaskMgr(ser, op, optB)
-
-	base := time.Now()
-	const n = 8
-	for i := 0; i < n; i++ {
-		if err := ser.Add(&testTask{
-			ID:         primitive.NewObjectID(),
-			Type:       40,
-			Order:      true,
-			CreateTime: base.Add(time.Duration(i) * time.Second),
-			UpdateTime: base,
-		}); err != nil {
-			t.Fatalf("Add: %v", err)
-		}
-	}
-
-	waitFor(t, 15*time.Second, func() bool { return done.Load() == n })
-
-	if p := peak.Load(); p > 1 {
-		t.Fatalf("跨实例有序任务应串行, 并发峰值 %d, 期望 1", p)
-	}
-
-	mgrA.Shutdown()
-	mgrB.Shutdown()
 }
 
 // ---------- 修复 6：优雅关闭 ----------
@@ -248,11 +185,11 @@ func TestShutdownGraceful(t *testing.T) {
 	requireMongo(t)
 	db, coll := "task_test_shutdown", "tasks"
 	dropCollection(t, db, coll)
-	ser := serialize.Mongo[testTask](mongoClient, db, coll)
+	ser := serialize.Mongo(mongoClient, db, coll)
 
 	started := make(chan struct{}, 1)
 	var handled atomic.Bool
-	op := &fnOperator{fn: func(tk itask.ITask) error {
+	op := &fnOperator{fn: func(tk *task.Task) error {
 		started <- struct{}{}
 		time.Sleep(200 * time.Millisecond)
 		handled.Store(true)
@@ -262,13 +199,10 @@ func TestShutdownGraceful(t *testing.T) {
 	opt.SetConcurrenceNum(2)
 	mgr := NewTaskMgr(ser, op, opt)
 
-	id := primitive.NewObjectID()
-	if err := mgr.Add(&testTask{ID: id, Type: 1, Payload: "s"}); err != nil {
-		t.Fatalf("Add: %v", err)
-	}
-	<-started // 等任务开始处理
+	id := addTask(t, mgr, 1, false, "s")
+	<-started
 
-	mgr.Shutdown() // 应等待处理完成（200ms）
+	mgr.Shutdown()
 
 	if !handled.Load() {
 		t.Fatal("Shutdown 应等待正在处理的任务完成")
@@ -283,7 +217,7 @@ func TestAddAfterShutdownReturnsError(t *testing.T) {
 	requireMongo(t)
 	db, coll := "task_test_shutdown_add", "tasks"
 	dropCollection(t, db, coll)
-	ser := serialize.Mongo[testTask](mongoClient, db, coll)
+	ser := serialize.Mongo(mongoClient, db, coll)
 	op := &fnOperator{}
 	opt := Options()
 	opt.SetConcurrenceNum(2)
@@ -291,7 +225,7 @@ func TestAddAfterShutdownReturnsError(t *testing.T) {
 
 	mgr.Shutdown()
 
-	if err := mgr.Add(&testTask{ID: primitive.NewObjectID(), Type: 1}); err == nil {
+	if err := mgr.Add(mkPayload("x"), task.Meta{Type: 1}); err == nil {
 		t.Fatal("Shutdown 后 Add 应返回错误")
 	}
 }

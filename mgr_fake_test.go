@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/ndsky1003/task/itask"
+	"github.com/ndsky1003/task/task"
 	"github.com/ndsky1003/task/taskmgrstatus"
 )
 
@@ -14,9 +14,9 @@ import (
 
 type fakeSerialize struct {
 	mu        sync.Mutex
-	initTasks []itask.ITask // 待处理队列（FIFO）
-	removed   []itask.ITask
-	restored  []itask.ITask
+	initTasks []*task.Task // 待处理队列（FIFO）
+	removed   []*task.Task
+	restored  []*task.Task
 
 	nextErr      error
 	forceHasNext bool
@@ -24,16 +24,16 @@ type fakeSerialize struct {
 	addErr       error
 	removeErr    error
 	updateErr    error
-	initErr      error
+	recoverErr   error
 
 	removeFailTimes int // Remove 前 N 次失败
 	removeSuccess   int // Remove 成功次数
 	updateFailTimes int // UpdateStatus2Init 前 N 次失败
 }
 
-func (f *fakeSerialize) Init() error { return f.initErr }
+func (f *fakeSerialize) Recover() error { return f.recoverErr }
 
-func (f *fakeSerialize) Add(t itask.ITask) error {
+func (f *fakeSerialize) Add(t *task.Task) error {
 	if f.addErr != nil {
 		return f.addErr
 	}
@@ -43,38 +43,38 @@ func (f *fakeSerialize) Add(t itask.ITask) error {
 	return nil
 }
 
-func (f *fakeSerialize) Next(exclude ...uint32) (itask.ITask, error) {
+func (f *fakeSerialize) Next(exclude ...uint32) (*task.Task, error) {
 	if f.nextErr != nil {
 		return nil, f.nextErr
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	for i, t := range f.initTasks {
-		if containsType(exclude, t.GetType()) {
+		if containsType(exclude, t.Type) {
 			continue
 		}
 		f.initTasks = append(f.initTasks[:i], f.initTasks[i+1:]...)
 		return t, nil
 	}
-	return nil, itask.ErrNoTask
+	return nil, task.ErrNoTask
 }
 
-func (f *fakeSerialize) NextByType(tp uint32) (itask.ITask, error) {
+func (f *fakeSerialize) NextByType(tp uint32) (*task.Task, error) {
 	if f.nextErr != nil {
 		return nil, f.nextErr
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	for i, t := range f.initTasks {
-		if t.GetType() == tp {
+		if t.Type == tp {
 			f.initTasks = append(f.initTasks[:i], f.initTasks[i+1:]...)
 			return t, nil
 		}
 	}
-	return nil, itask.ErrNoTask
+	return nil, task.ErrNoTask
 }
 
-func (f *fakeSerialize) Remove(t itask.ITask) error {
+func (f *fakeSerialize) Remove(t *task.Task) error {
 	f.mu.Lock()
 	f.removed = append(f.removed, t)
 	fail := f.removeFailTimes > 0
@@ -91,7 +91,7 @@ func (f *fakeSerialize) Remove(t itask.ITask) error {
 	return f.removeErr
 }
 
-func (f *fakeSerialize) UpdateStatus2Init(t itask.ITask) error {
+func (f *fakeSerialize) UpdateStatus2Init(t *task.Task) error {
 	f.mu.Lock()
 	fail := f.updateFailTimes > 0
 	if fail {
@@ -121,7 +121,7 @@ func (f *fakeSerialize) HasNext(exclude ...uint32) (bool, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	for _, t := range f.initTasks {
-		if !containsType(exclude, t.GetType()) {
+		if !containsType(exclude, t.Type) {
 			return true, nil
 		}
 	}
@@ -139,7 +139,7 @@ func containsType(types []uint32, t uint32) bool {
 
 // ---------- 基于 fakeSerialize 的控制流测试 ----------
 
-// TestRunLoopNextErrorContinues Next 返回非 ErrNoTask 错误时循环不应停止或 panic。
+// TestRunLoopNextErrorContinues Next 返回非 task.ErrNoTask 错误时循环不应停止或 panic。
 func TestRunLoopNextErrorContinues(t *testing.T) {
 	f := &fakeSerialize{nextErr: errors.New("db down")}
 	op := &fnOperator{}

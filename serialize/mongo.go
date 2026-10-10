@@ -2,23 +2,23 @@ package serialize
 
 import (
 	"context"
-	"errors"
 	"time"
 
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
 
-	"github.com/ndsky1003/task/itask"
+	"github.com/ndsky1003/task/task"
 	"github.com/ndsky1003/task/taskstatus"
 )
 
-type mongo_serialize[T any] struct {
+type mongo_serialize struct {
 	client         *mongo.Client
 	database, coll string
 }
 
-func Mongo[T any](client *mongo.Client, database, coll string) *mongo_serialize[T] {
+// Mongo 创建基于 MongoDB 的任务序列化器。构造函数会创建索引，失败即 panic。
+func Mongo(client *mongo.Client, database, coll string) *mongo_serialize {
 	if client == nil {
 		panic("client is nil")
 	}
@@ -39,125 +39,89 @@ func Mongo[T any](client *mongo.Client, database, coll string) *mongo_serialize[
 		panic(err)
 	}
 
-	return &mongo_serialize[T]{
+	return &mongo_serialize{
 		client:   client,
 		database: database,
 		coll:     coll,
 	}
 }
 
-func (this *mongo_serialize[T]) col() *mongo.Collection {
+func (this *mongo_serialize) col() *mongo.Collection {
 	return this.client.Database(this.database).Collection(this.coll)
 }
 
-// 初始化：将异常退出时遗留的“处理中”任务还原为初始状态，避免任务丢失
-func (this *mongo_serialize[T]) Init() error {
+// Recover 恢复：将异常退出时遗留的“处理中”任务还原为初始状态，避免任务丢失
+func (this *mongo_serialize) Recover() error {
 	_, err := this.col().UpdateMany(context.Background(),
 		bson.M{"Status": taskstatus.Handling},
 		bson.M{"$set": bson.M{"Status": taskstatus.Init}})
 	return err
 }
 
-func (this *mongo_serialize[T]) Add(task itask.ITask) error {
+func (this *mongo_serialize) Add(task *task.Task) error {
 	_, err := this.col().InsertOne(context.Background(), task)
 	return err
 }
 
-func (this *mongo_serialize[T]) Next(exclude_t ...uint32) (itask.ITask, error) {
-	filter := bson.M{
-		"Status": taskstatus.Init,
-	}
-	if len(exclude_t) > 0 {
-		arr := make([]uint32, len(exclude_t))
-		copy(arr, exclude_t)
+// initFilter 构造「待处理」任务的查询条件，可选排除某些类型。
+func (this *mongo_serialize) initFilter(exclude ...uint32) bson.M {
+	filter := bson.M{"Status": taskstatus.Init}
+	if len(exclude) > 0 {
+		arr := make([]uint32, len(exclude))
+		copy(arr, exclude)
 		filter["Type"] = bson.M{"$nin": arr}
 	}
+	return filter
+}
 
-	// 先查询并校验，成功后再更新状态，避免校验失败时任务卡在“处理中”
-	var doc T
+// next 查询一个待处理任务并原子地将其置为「处理中」。
+func (this *mongo_serialize) next(filter bson.M, sortKey string) (*task.Task, error) {
+	var doc task.Task
 	if err := this.col().FindOne(context.Background(), filter,
-		options.FindOne().SetSort(bson.M{"UpdateTime": 1})).Decode(&doc); err != nil {
+		options.FindOne().SetSort(bson.M{sortKey: 1})).Decode(&doc); err != nil {
 		if err == mongo.ErrNoDocuments {
-			return nil, itask.ErrNoTask
+			return nil, task.ErrNoTask
 		}
 		return nil, err
 	}
-	var d any = &doc
-	task, ok := d.(itask.ITask)
-	if !ok {
-		return nil, errors.New("type doc is not implement ITask")
-	}
 
 	res, err := this.col().UpdateOne(context.Background(),
-		bson.M{"_id": task.GetID(), "Status": taskstatus.Init},
+		bson.M{"_id": doc.ID, "Status": taskstatus.Init},
 		bson.M{"$set": bson.M{"UpdateTime": time.Now(), "Status": taskstatus.Handling}})
 	if err != nil {
 		return nil, err
 	}
 	if res.MatchedCount == 0 {
-		return nil, itask.ErrNoTask
+		return nil, task.ErrNoTask
 	}
-	return task, nil
+	return &doc, nil
 }
 
-func (this *mongo_serialize[T]) NextByType(t uint32) (itask.ITask, error) {
-	filter := bson.M{
-		"Status": taskstatus.Init,
-		"Type":   t,
-	}
-
-	// 先查询并校验，成功后再更新状态
-	var doc T
-	if err := this.col().FindOne(context.Background(), filter,
-		options.FindOne().SetSort(bson.M{"CreateTime": 1})).Decode(&doc); err != nil {
-		if err == mongo.ErrNoDocuments {
-			return nil, itask.ErrNoTask
-		}
-		return nil, err
-	}
-	var d any = &doc
-	task, ok := d.(itask.ITask)
-	if !ok {
-		return nil, errors.New("type doc is not implement ITask")
-	}
-
-	res, err := this.col().UpdateOne(context.Background(),
-		bson.M{"_id": task.GetID(), "Status": taskstatus.Init},
-		bson.M{"$set": bson.M{"UpdateTime": time.Now(), "Status": taskstatus.Handling}})
-	if err != nil {
-		return nil, err
-	}
-	if res.MatchedCount == 0 {
-		return nil, itask.ErrNoTask
-	}
-	return task, nil
+func (this *mongo_serialize) Next(exclude_t ...uint32) (*task.Task, error) {
+	return this.next(this.initFilter(exclude_t...), "UpdateTime")
 }
 
-func (this *mongo_serialize[T]) HasNext(exclude_t ...uint32) (bool, error) {
-	filter := bson.M{
-		"Status": taskstatus.Init,
-	}
-	if len(exclude_t) > 0 {
-		arr := make([]uint32, len(exclude_t))
-		copy(arr, exclude_t)
-		filter["Type"] = bson.M{"$nin": arr}
-	}
+func (this *mongo_serialize) NextByType(t uint32) (*task.Task, error) {
+	return this.next(bson.M{"Status": taskstatus.Init, "Type": t}, "CreateTime")
+}
+
+func (this *mongo_serialize) HasNext(exclude_t ...uint32) (bool, error) {
 	count, err := this.col().CountDocuments(
 		context.Background(),
-		filter,
+		this.initFilter(exclude_t...),
 	)
 	return count > 0, err
 }
 
-func (this *mongo_serialize[T]) Remove(t itask.ITask) error {
-	_, err := this.col().DeleteOne(context.Background(), bson.M{"_id": t.GetID()})
+func (this *mongo_serialize) Remove(t *task.Task) error {
+	_, err := this.col().DeleteOne(context.Background(), bson.M{"_id": t.ID})
 	return err
 }
 
-// 任务状态还原。eg:如果任务出错，需要将状态还原，等待下次执行
-func (this *mongo_serialize[T]) UpdateStatus2Init(t itask.ITask) error {
+// UpdateStatus2Init 任务状态还原，等待下次执行
+func (this *mongo_serialize) UpdateStatus2Init(t *task.Task) error {
 	_, err := this.col().UpdateByID(context.Background(),
-		t.GetID(),
+		t.ID,
 		bson.M{"$set": bson.M{"Status": taskstatus.Init}},
 	)
 	return err

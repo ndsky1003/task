@@ -33,6 +33,19 @@ func TestOptionSetOrderTaskHandleDeltaEmpty(t *testing.T) {
 	}
 }
 
+// TestOptionSetOrderTaskMaxRetry 最大重试次数仅接受正值。
+func TestOptionSetOrderTaskMaxRetry(t *testing.T) {
+	o := Options()
+	o.SetOrderTaskMaxRetry(5)
+	if o.OrderTaskMaxRetry != 5 {
+		t.Fatalf("期望 5，got %d", o.OrderTaskMaxRetry)
+	}
+	o.SetOrderTaskMaxRetry(0) // 零值不应覆盖
+	if o.OrderTaskMaxRetry != 5 {
+		t.Fatalf("零值不应覆盖, got %d", o.OrderTaskMaxRetry)
+	}
+}
+
 // TestOptionMerge 校验 Merge 只覆盖非零值。
 func TestOptionMerge(t *testing.T) {
 	o := Options()

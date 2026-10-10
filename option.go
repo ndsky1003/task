@@ -8,8 +8,7 @@ type Option struct {
 	ConcurrenceNum        uint32
 	NormalTaskHandleDelta time.Duration
 	OrderTaskHandleDelta  []time.Duration
-	OrderLockTTL          time.Duration // 有序任务跨实例锁的租约时长
-	OrderLockRetryDelta   time.Duration // 有序任务锁获取失败后的退避时间
+	OrderTaskMaxRetry     uint32 // 有序任务处理失败后的最大尝试次数（含首次），超出则标记死信
 }
 
 func Options() *Option {
@@ -26,8 +25,7 @@ func Options() *Option {
 			37 * time.Second,
 			69 * time.Second,
 		},
-		OrderLockTTL:        10 * time.Minute,
-		OrderLockRetryDelta: 5 * time.Second,
+		OrderTaskMaxRetry: 8,
 	}
 }
 
@@ -52,17 +50,10 @@ func (this *Option) SetOrderTaskHandleDelta(a []time.Duration) {
 	this.OrderTaskHandleDelta = a
 }
 
-// 有序任务跨实例锁的租约时长。需大于处理单个有序任务类型的最长耗时。
-func (this *Option) SetOrderLockTTL(a time.Duration) {
+// 有序任务处理失败后的最大尝试次数（含首次），超出则标记死信。
+func (this *Option) SetOrderTaskMaxRetry(a uint32) {
 	if a > 0 {
-		this.OrderLockTTL = a
-	}
-}
-
-// 有序任务锁获取失败后的退避时间。
-func (this *Option) SetOrderLockRetryDelta(a time.Duration) {
-	if a > 0 {
-		this.OrderLockRetryDelta = a
+		this.OrderTaskMaxRetry = a
 	}
 }
 
@@ -86,12 +77,8 @@ func (this *Option) merge(delta *Option) *Option {
 		this.OrderTaskHandleDelta = delta.OrderTaskHandleDelta
 	}
 
-	if delta.OrderLockTTL != 0 {
-		this.OrderLockTTL = delta.OrderLockTTL
-	}
-
-	if delta.OrderLockRetryDelta != 0 {
-		this.OrderLockRetryDelta = delta.OrderLockRetryDelta
+	if delta.OrderTaskMaxRetry != 0 {
+		this.OrderTaskMaxRetry = delta.OrderTaskMaxRetry
 	}
 	return this
 }
