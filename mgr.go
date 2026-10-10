@@ -1,6 +1,7 @@
 package task
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -28,11 +29,19 @@ type task_mgr struct {
 	task_serialize            serialize.ITaskSerialize
 	_handle_task_operator     IOperator
 	done                      chan struct{}
-	concurrenceNum            chan struct{} // 限流
+	concurrenceNum            chan struct{} // 普通任务限流
+	orderConcurrenceNum       chan struct{} // 有序任务限流（同时处理的有序类型数上限）
 	opt                       *Option
 	shutdown                  atomic.Bool
 	runLoopWg                 sync.WaitGroup // 跟踪 run_loop，保证优雅关闭时不再新增任务 goroutine
 	wg                        sync.WaitGroup // 跟踪任务处理 goroutine
+
+	// metrics
+	added    atomic.Uint64 // 累计添加的任务数
+	handled  atomic.Uint64 // 累计成功处理数
+	failed   atomic.Uint64 // 累计失败次数（含重试）
+	dead     atomic.Uint64 // 累计死信数
+	handling atomic.Int64  // 当前处理中的任务数
 }
 
 // newID 生成任务主键（UUID v4）。
@@ -41,8 +50,7 @@ func newID() string {
 }
 
 // NewTaskMgr 创建任务管理器并启动任务循环。
-// 注意：最大并发数 opt.ConcurrenceNum 必须大于有序任务类型数，
-// 否则有序任务会占满并发槽，导致普通任务无法执行。
+// 普通任务与有序任务使用独立的并发控制（分别由 ConcurrenceNum、OrderConcurrenceNum 限制），互不阻塞。
 func NewTaskMgr(task_serialize serialize.ITaskSerialize, op IOperator, opts ...*Option) *task_mgr {
 	if task_serialize == nil {
 		panic("task_serialize must not nil")
@@ -54,6 +62,7 @@ func NewTaskMgr(task_serialize serialize.ITaskSerialize, op IOperator, opts ...*
 
 	c := &task_mgr{
 		concurrenceNum:        make(chan struct{}, opt.ConcurrenceNum),
+		orderConcurrenceNum:   make(chan struct{}, opt.OrderConcurrenceNum),
 		task_serialize:        task_serialize,
 		_handle_task_operator: op,
 		opt:                   opt,
@@ -189,6 +198,7 @@ func (this *task_mgr) add(task *task.Task) error {
 	}
 	err := this.task_serialize.Add(task)
 	if err == nil {
+		this.added.Add(1)
 		this.Start()
 	}
 	return err
@@ -210,8 +220,8 @@ func (this *task_mgr) run_loop(done chan struct{}) {
 		t, err := this.task_serialize.Next(this.get_handling_order_task_types()...)
 		if err == nil {
 			if t.Order {
+				// 有序任务在 goroutine 内占槽，避免阻塞 run_loop 获取普通任务
 				this.wg.Add(1)
-				this.concurrenceNum <- struct{}{}
 				this.push_handling_order_task_types(t.Type)
 				go this.handleOrderTasks(t)
 			} else {
@@ -240,6 +250,7 @@ func (this *task_mgr) handleTask(task *task.Task) {
 		this.wg.Done()
 	}()
 	if err := this.handleTaskSafely(task); err != nil {
+		this.failed.Add(1)
 		time.AfterFunc(this.opt.NormalTaskHandleDelta, func() {
 			this.handleStatus(&handleStatusReq{
 				status: taskmgrstatus.Start,
@@ -247,19 +258,41 @@ func (this *task_mgr) handleTask(task *task.Task) {
 			})
 		})
 	} else { // 处理成功，删除任务
+		this.handled.Add(1)
 		this.removeWithRetry(task)
 	}
 }
 
 // handleTaskSafely 调用用户处理函数并捕获 panic，将 panic 转为 error，避免进程崩溃。
 func (this *task_mgr) handleTaskSafely(task *task.Task) (err error) {
+	this.handling.Add(1)
 	defer func() {
+		this.handling.Add(-1)
 		if r := recover(); r != nil {
 			slog.Error("handle task panic", "task", task.ID, "panic", r)
 			err = fmt.Errorf("task panic: %v", r)
 		}
 	}()
+
+	// 优先使用支持 context 的 operator
+	if op, ok := this._handle_task_operator.(IContextOperator); ok {
+		ctx, cancel := this.taskContext()
+		defer cancel()
+		return op.HandleTaskCtx(ctx, task)
+	}
 	return this._handle_task_operator.HandleTask(task)
+}
+
+// taskContext 派生任务处理的 context：base context + 可选超时。
+func (this *task_mgr) taskContext() (context.Context, context.CancelFunc) {
+	ctx := this.opt.Context
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if this.opt.TaskTimeout > 0 {
+		return context.WithTimeout(ctx, this.opt.TaskTimeout)
+	}
+	return ctx, func() {}
 }
 
 // removeWithRetry 删除任务；失败按 NormalTaskHandleDelta 延迟重试，避免任务永久卡在 Handling。
@@ -298,15 +331,16 @@ func (this *task_mgr) sleepOrder(attempt uint32) {
 }
 
 // handleOrderTasks 串行处理某类型的所有有序任务：
-// 先处理传入的第一个，再按 CreateTime 顺序处理该类型的其余任务，全部完成后释放并发槽。
+// 先处理传入的第一个，再按 CreateTime 顺序处理该类型的其余任务，全部完成后释放有序并发槽。
 func (this *task_mgr) handleOrderTasks(first *task.Task) {
 	t := first.Type
+	this.orderConcurrenceNum <- struct{}{} // 占有序并发槽（在 goroutine 内阻塞，不影响 run_loop）
 	slog.Info("handleOrderTasks", "type", t)
 	dead := false
 	defer func() {
 		this.pop_handling_order_task_types(t)
 		slog.Info("defer handleOrderTasks", "type", t)
-		<-this.concurrenceNum
+		<-this.orderConcurrenceNum
 		this.wg.Done()
 		if dead {
 			// 当前任务被标记死信，但可能还有同类型任务未处理，唤醒 run_loop 继续
@@ -340,9 +374,11 @@ func (this *task_mgr) handleOrderTask(task *task.Task) (dead bool) {
 	for attempt := uint32(1); ; attempt++ {
 		err := this.handleTaskSafely(task)
 		if err == nil {
+			this.handled.Add(1)
 			this.removeWithRetry(task)
 			return false
 		}
+		this.failed.Add(1)
 		if attempt >= maxRetry {
 			slog.Error("order task dead", "type", task.Type, "attempt", attempt, "err", err)
 			// 标记死信，避免任务永久卡死或阻塞同类型任务；不再自动重试
@@ -350,6 +386,10 @@ func (this *task_mgr) handleOrderTask(task *task.Task) (dead bool) {
 				if err1 := dl.MarkDead(task); err1 != nil {
 					slog.Error("mark dead failed", "task", task.ID, "err", err1)
 				}
+			}
+			this.dead.Add(1)
+			if this.opt.OnDead != nil {
+				this.opt.OnDead(task, err)
 			}
 			return true
 		}

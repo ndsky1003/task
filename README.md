@@ -165,10 +165,65 @@ mgr.Shutdown()
 
 | 方法 | 默认值 | 说明 |
 | --- | --- | --- |
-| `SetConcurrenceNum(n)` | 10（上限 1000） | 最大并发数 |
+| `SetConcurrenceNum(n)` | 10（上限 1000） | 普通任务最大并发数 |
+| `SetOrderConcurrenceNum(n)` | 10（上限 1000） | 有序任务并发数（同时处理的有序任务类型数上限） |
 | `SetNormalTaskHandleDelta(d)` | 1s | 普通任务处理失败后的重试间隔 |
 | `SetOrderTaskHandleDelta(s)` | 递增序列 | 有序任务处理失败后的重试间隔序列 |
 | `SetOrderTaskMaxRetry(n)` | 8 | 有序任务处理失败后的最大尝试次数（含首次），超出则标记死信 |
+| `SetContext(ctx)` | 无 | 任务处理的 base context（用于取消在途任务） |
+| `SetTaskTimeout(d)` | 0（不超时） | 单任务处理超时 |
+| `SetOnDead(fn)` | 无 | 任务标记死信时的回调（用于告警/人工处理） |
+
+## 可观测性
+
+### 统计指标
+
+`mgr.Stats()` 返回运行统计快照，可周期性拉取接入 Prometheus 等监控：
+
+```go
+s := mgr.Stats()
+// s.Added   累计添加的任务数
+// s.Handled 累计成功处理数
+// s.Failed  累计失败次数（含重试）
+// s.Dead    累计死信数
+// s.Handling 当前处理中的任务数
+```
+
+### 死信回调
+
+任务重试耗尽被标记死信时触发回调，用于告警、记录、人工介入：
+
+```go
+opt.SetOnDead(func(t *task.Task, err error) {
+	// 告警 / 记录死信任务
+	log.Printf("任务 %s 进入死信: %v", t.ID, err)
+})
+```
+
+### Context 与超时
+
+实现可选接口 `task.IContextOperator` 的处理逻辑可拿到 context（支持超时与取消）：
+
+```go
+type MyOperator struct{}
+
+func (o *MyOperator) HandleTask(t *task.Task) error { return nil } // IOperator 必需
+
+// 实现 IContextOperator 后，库会优先调用 HandleTaskCtx
+func (o *MyOperator) HandleTaskCtx(ctx context.Context, t *task.Task) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err() // 超时或取消
+	default:
+	}
+	// ... 处理逻辑 ...
+	return nil
+}
+
+opt := taskmgr.Options()
+opt.SetTaskTimeout(30 * time.Second) // 单任务超时
+// opt.SetContext(ctx)                // 取消整个管理器的在途任务
+```
 
 ## 性能对比
 
@@ -207,7 +262,7 @@ mgr.Shutdown()
 
 ## 注意事项
 
-- **并发数必须大于有序任务类型数**：否则有序任务会占满并发槽，普通任务无法执行。
+- **普通任务与有序任务独立并发控制**：`ConcurrenceNum` 限制普通任务并发，`OrderConcurrenceNum` 限制同时处理的有序任务类型数，二者互不影响，有序任务不会饿死普通任务。
 - **业务数据由调用者序列化为 `[]byte`**：格式不限（JSON、protobuf、gob 等）；消费时在 `HandleTask` 里按 `Type` 自行反序列化。
 - **任务主键为 `string`**：`Meta.ID` 为空时由库生成随机 ID；如需自定义，须保证唯一。
 - **处理成功的任务会直接删除**，不存在「完成」状态残留；删除失败会自动重试，不会静默丢失。

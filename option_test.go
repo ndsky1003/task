@@ -46,6 +46,23 @@ func TestOptionSetOrderTaskMaxRetry(t *testing.T) {
 	}
 }
 
+// TestOptionSetOrderConcurrenceNum 有序任务并发数上限与截断。
+func TestOptionSetOrderConcurrenceNum(t *testing.T) {
+	o := Options()
+	o.SetOrderConcurrenceNum(1001)
+	if o.OrderConcurrenceNum != 1000 {
+		t.Fatalf("期望截断为 1000，got %d", o.OrderConcurrenceNum)
+	}
+	o.SetOrderConcurrenceNum(5)
+	if o.OrderConcurrenceNum != 5 {
+		t.Fatalf("期望 5，got %d", o.OrderConcurrenceNum)
+	}
+	o.SetOrderConcurrenceNum(0) // 零值不应覆盖
+	if o.OrderConcurrenceNum != 5 {
+		t.Fatalf("零值不应覆盖, got %d", o.OrderConcurrenceNum)
+	}
+}
+
 // TestOptionMerge 校验 Merge 只覆盖非零值。
 func TestOptionMerge(t *testing.T) {
 	o := Options()
